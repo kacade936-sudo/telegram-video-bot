@@ -1,0 +1,162 @@
+import os
+import glob
+import logging
+import tempfile
+import threading
+from urllib.parse import urlparse
+from flask import Flask
+import telebot
+from yt_dlp import YoutubeDL
+from openai import OpenAI
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Load environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
+PORT = int(os.getenv("PORT", 8080))
+
+if not BOT_TOKEN:
+    raise ValueError("Missing 'BOT_TOKEN' environment variable.")
+
+# Initialize Hugging Face-routed OpenAI client
+ai_client = OpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=HF_TOKEN or "dummy_key"
+)
+
+# Initialize Telegram Bot
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# Initialize Flask App (Satisfies Render Web Service Port Binding)
+app = Flask(__name__)
+
+@app.route("/")
+def health_check():
+    return "Bot is running!", 200
+
+
+# --- Bot Command Handlers ---
+
+@bot.message_handler(commands=["start"])
+def send_welcome(message):
+    welcome_text = (
+        "👋 **Welcome to the Video Downloader Bot!**\n\n"
+        "Send me any public link from:\n"
+        "• YouTube\n"
+        "• TikTok\n"
+        "• Facebook\n\n"
+        "Type /help for more information."
+    )
+    bot.reply_to(message, welcome_text, parse_mode="Markdown")
+
+
+@bot.message_handler(commands=["help"])
+def send_help(message):
+    help_text = (
+        "ℹ️ **How to use this bot:**\n\n"
+        "1. Copy a video link from YouTube, TikTok, or Facebook.\n"
+        "2. Paste and send the link here.\n"
+        "3. Wait a few moments while the bot downloads and sends it to you.\n\n"
+        "_Note: Telegram Bot API enforces a maximum upload limit of 50 MB per video._"
+    )
+    bot.reply_to(message, help_text, parse_mode="Markdown")
+
+
+# --- Link & Video Processing ---
+
+def is_valid_url(url: str) -> bool:
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except Exception:
+        return False
+
+
+@bot.message_handler(func=lambda msg: msg.text and is_valid_url(msg.text.strip()))
+def handle_video_download(message):
+    url = message.text.strip()
+    status_msg = bot.reply_to(message, "⏳ Fetching and downloading your video, please wait...")
+
+    # Create an isolated temporary directory for the download
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_template = os.path.join(temp_dir, "%(title).50s-%(id)s.%(ext)s")
+        
+        # yt-dlp configuration
+        ydl_opts = {
+            "outtmpl": output_template,
+            "format": "best[ext=mp4]/best",
+            # Restrict max file size to avoid Telegram API timeouts/errors (Telegram allows 50MB max via Bot API)
+            "max_filesize": 50 * 1024 * 1024,
+            "quiet": True,
+            "no_warnings": True,
+        }
+
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info_dict = ydl.extract_info(url, download=True)
+                video_title = info_dict.get("title", "Downloaded Video")
+
+            # Find the downloaded file inside the temporary directory
+            files = glob.glob(os.path.join(temp_dir, "*"))
+            if not files:
+                bot.edit_message_text(
+                    "❌ Failed to process the video. It might exceed the 50 MB Telegram limit or is private/inaccessible.",
+                    chat_id=message.chat.id,
+                    message_id=status_msg.message_id
+                )
+                return
+
+            video_path = files[0]
+
+            # Send video back to the user
+            bot.edit_message_text(
+                "📤 Uploading video to Telegram...",
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id
+            )
+
+            with open(video_path, "rb") as video_file:
+                bot.send_video(
+                    chat_id=message.chat.id,
+                    video=video_file,
+                    caption=f"🎬 **{video_title}**",
+                    parse_mode="Markdown",
+                    supports_streaming=True
+                )
+
+            # Delete the status message once complete
+            bot.delete_message(chat_id=message.chat.id, message_id=status_msg.message_id)
+
+        except Exception as e:
+            logging.error(f"Download/Upload error: {e}")
+            error_message = str(e)
+            if "File is larger than max-filesize" in error_message:
+                reply = "⚠️ The requested video is larger than 50 MB, which exceeds Telegram's Bot upload limit."
+            else:
+                reply = "❌ An error occurred while processing your request. Please ensure the link is public and valid."
+            
+            bot.edit_message_text(
+                reply,
+                chat_id=message.chat.id,
+                message_id=status_msg.message_id
+            )
+
+
+# --- Startup & Execution ---
+
+def run_bot():
+    """Runs polling in a background thread."""
+    logging.info("Starting Telegram Bot polling...")
+    bot.infinity_polling(timeout=10, long_polling_timeout=5)
+
+
+if __name__ == "__main__":
+    # Start bot polling in a non-blocking daemon thread
+    polling_thread = threading.Thread(target=run_bot, daemon=True)
+    polling_thread.start()
+
+    # Run Flask server on the main thread to satisfy Render's health check
+    logging.info(f"Starting Flask server on port {PORT}...")
+    app.run(host="0.0.0.0", port=PORT)
